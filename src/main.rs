@@ -5,7 +5,7 @@ use std::ffi::CStr;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Error};
@@ -121,6 +121,7 @@ impl Instance {
     }
 }
 
+#[derive(Clone)]
 struct PhysicalDevice {
     device: vk::PhysicalDevice,
     graphics_queue_family: u32,
@@ -245,6 +246,31 @@ impl Device {
         }
     }
 
+    unsafe fn barrier(&self, cmd: &CommandBuffer, texture: &Texture, from: vk::ImageLayout, to: vk::ImageLayout) {
+        let barrier = vk::ImageMemoryBarrier::builder()
+            .old_layout(from)
+            .new_layout(to)
+            .image(texture.raw())
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .build();
+
+        self.device.cmd_pipeline_barrier(
+            cmd.raw(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    }
+
     fn raw(&self) -> &ash::Device {
         &self.device
     }
@@ -314,7 +340,7 @@ impl Texture {
             .samples(vk::SampleCountFlags::TYPE_1)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC);
 
         let image = device.raw().create_image(&create_info, None)?;
         let requirements = device.raw().get_image_memory_requirements(image);
@@ -518,11 +544,96 @@ impl ComputePipeline {
             pipeline,
         }
     }
+
+    fn raw(&self) -> vk::Pipeline {
+        self.pipeline
+    }
+}
+
+struct CommandPool {
+    device: Arc<Device>,
+
+    command_pool: vk::CommandPool,
+}
+
+impl Drop for CommandPool {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .raw()
+                .destroy_command_pool(self.command_pool, None);
+        }
+    }
+}
+
+impl CommandPool {
+    unsafe fn new(device: Arc<Device>, queue_family_index: u32) -> Self {
+        let create_info = vk::CommandPoolCreateInfo::builder()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+
+        let command_pool = device
+            .raw()
+            .create_command_pool(&create_info, None)
+            .unwrap();
+
+        Self {
+            device,
+            command_pool,
+        }
+    }
+
+    fn raw(&self) -> vk::CommandPool {
+        self.command_pool
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+struct CommandBuffer {
+    command_pool: Arc<CommandPool>,
+
+    buf: vk::CommandBuffer,
+}
+
+impl Drop for CommandBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            self.command_pool
+                .device()
+                .raw()
+                .free_command_buffers(self.command_pool.raw(), &[self.buf]);
+        }
+    }
+}
+
+impl CommandBuffer {
+    unsafe fn new(command_pool: Arc<CommandPool>) -> Self {
+        let allocate_info = vk::CommandBufferAllocateInfo::builder()
+            .command_buffer_count(1)
+            .command_pool(command_pool.raw())
+            .level(vk::CommandBufferLevel::PRIMARY);
+
+        let buf = command_pool
+            .device()
+            .raw()
+            .allocate_command_buffers(&allocate_info)
+            .unwrap()[0];
+
+        Self { command_pool, buf }
+    }
+
+    fn raw(&self) -> vk::CommandBuffer {
+        self.buf
+    }
 }
 
 struct Renderer {
     instance: Arc<Instance>,
     device: Arc<Device>,
+    command_pool: Arc<CommandPool>,
 
     output: Texture,
     pipeline: ComputePipeline,
@@ -538,9 +649,13 @@ impl Renderer {
                 println!("{}: {}", i, device.name);
             }
 
-            let device = Arc::new(Device::new(
-                Arc::clone(&instance),
-                physical_devices.swap_remove(0),
+            let physical_device = physical_devices.swap_remove(0);
+
+            let device = Arc::new(Device::new(Arc::clone(&instance), physical_device.clone()));
+
+            let command_pool = Arc::new(CommandPool::new(
+                Arc::clone(&device),
+                physical_device.graphics_queue_family,
             ));
 
             let output = Texture::new(
@@ -565,6 +680,8 @@ impl Renderer {
             Self {
                 instance,
                 device,
+                command_pool,
+
                 output,
                 pipeline,
             }
@@ -573,7 +690,70 @@ impl Renderer {
 
     fn render(&self) {
         unsafe {
-            self.device.device.device_wait_idle().unwrap();
+            let cmd = CommandBuffer::new(Arc::clone(&self.command_pool));
+
+            let begin_info = vk::CommandBufferBeginInfo::builder();
+            self.device
+                .raw()
+                .begin_command_buffer(cmd.raw(), &begin_info)
+                .unwrap();
+
+            self.device.barrier(&cmd, &self.output, vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+            self.device.raw().cmd_bind_pipeline(
+                cmd.raw(),
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline.raw(),
+            );
+            self.device.raw().cmd_dispatch(cmd.raw(), 10, 10, 1);
+
+            self.device.barrier(&cmd, &self.output, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+
+            let regions = &[
+                vk::BufferImageCopy::builder()
+                    .buffer_offset(0)
+                    .image_extent(vk::Extent3D {
+                        width: 1024,
+                        height: 1024,
+                        depth: 1,
+                    })
+                    .build(),
+            ];
+
+            // self.device.raw().cmd_copy_image_to_buffer(
+            //     cmd.raw(),
+            //     self.output.raw(),
+            //     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            //     dst_buffer,
+            //     regions,
+            // );
+
+            self.device.raw().end_command_buffer(cmd.raw()).unwrap();
+
+            self.device.sync.fetch_add(1, Ordering::SeqCst);
+
+            let wait_values = &[];
+            let signal_values = &[self.device.sync.load(Ordering::SeqCst)];
+
+            let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::builder()
+                .wait_semaphore_values(wait_values)
+                .signal_semaphore_values(signal_values);
+
+            let submit_command_buffers = &[cmd.raw()];
+            let signal_semaphores = &[self.device.timeline_semaphore];
+
+            let submit_info = vk::SubmitInfo::builder()
+                .command_buffers(submit_command_buffers)
+                .signal_semaphores(signal_semaphores)
+                .push_next(&mut timeline_info)
+                .build();
+
+            self.device
+                .raw()
+                .queue_submit(self.device.queue, &[submit_info], vk::Fence::null())
+                .unwrap();
+
+            self.device.raw().device_wait_idle().unwrap();
         }
     }
 }
