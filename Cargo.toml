@@ -6,7 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.79"
 ash = "0.37.3"
 bytemuck = "1.14.3"
+gpu-alloc = "0.6.0"
+gpu-alloc-ash = "0.6.0"
 hassle-rs = "0.11.0"
 png = "0.17.12"
