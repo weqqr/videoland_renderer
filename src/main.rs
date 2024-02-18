@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Error, anyhow};
+use anyhow::{anyhow, Error};
 use ash::extensions::{ext, khr};
 use ash::vk;
 use hassle_rs::{Dxc, DxcCompiler, DxcIncludeHandler, DxcLibrary};
@@ -244,15 +244,292 @@ impl Device {
             allocator,
         }
     }
+
+    fn raw(&self) -> &ash::Device {
+        &self.device
+    }
+
+    fn allocator(&self) -> GpuAllocator {
+        Arc::clone(&self.allocator)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Extent3D {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+}
+
+pub struct TextureDesc {
+    pub extent: Extent3D,
+}
+
+pub struct TextureViewDesc {
+    pub extent: Extent3D,
+}
+
+#[derive(Clone, Copy)]
+pub enum TextureLayout {
+    Undefined,
+    General,
+    Color,
+    DepthStencil,
+    TransferSrc,
+    TransferDst,
+}
+
+pub struct Texture {
+    device: Arc<Device>,
+    allocator: GpuAllocator,
+    allocation: Option<gpu_alloc::MemoryBlock<vk::DeviceMemory>>,
+    image: vk::Image,
+}
+
+impl Drop for Texture {
+    fn drop(&mut self) {
+        unsafe {
+            self.allocator.write().unwrap().dealloc(
+                gpu_alloc_ash::AshMemoryDevice::wrap(self.device.raw()),
+                self.allocation.take().unwrap(),
+            );
+
+            self.device.raw().destroy_image(self.image, None);
+        }
+    }
+}
+
+impl Texture {
+    unsafe fn new(device: Arc<Device>, desc: &TextureDesc) -> Result<Self, Error> {
+        let create_info = vk::ImageCreateInfo::builder()
+            .array_layers(1)
+            .extent(vk::Extent3D {
+                width: desc.extent.width,
+                height: desc.extent.height,
+                depth: desc.extent.depth,
+            })
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .image_type(vk::ImageType::TYPE_2D)
+            .mip_levels(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT);
+
+        let image = device.raw().create_image(&create_info, None)?;
+        let requirements = device.raw().get_image_memory_requirements(image);
+
+        let allocator = device.allocator();
+
+        let allocation = allocator.write().unwrap().alloc(
+            gpu_alloc_ash::AshMemoryDevice::wrap(device.raw()),
+            gpu_alloc::Request {
+                size: requirements.size,
+                align_mask: requirements.alignment,
+                usage: gpu_alloc::UsageFlags::FAST_DEVICE_ACCESS,
+                memory_types: requirements.memory_type_bits,
+            },
+        )?;
+
+        device
+            .raw()
+            .bind_image_memory(image, *allocation.memory(), allocation.offset())?;
+
+        Ok(Self {
+            device,
+            allocator,
+            allocation: Some(allocation),
+            image,
+        })
+    }
+
+    fn raw(&self) -> vk::Image {
+        self.image
+    }
+}
+
+#[derive(Clone)]
+pub struct TextureView {
+    is_managed: bool,
+    device: Arc<Device>,
+    image_view: vk::ImageView,
+    width: u32,
+    height: u32,
+}
+
+impl Drop for TextureView {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.is_managed {
+                self.device.raw().destroy_image_view(self.image_view, None);
+            }
+        }
+    }
+}
+
+impl TextureView {
+    unsafe fn new(
+        device: Arc<Device>,
+        texture: &Texture,
+        desc: &crate::TextureViewDesc,
+    ) -> Result<Self, Error> {
+        let subresource_range = vk::ImageSubresourceRange::builder()
+            .aspect_mask(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
+            .layer_count(vk::REMAINING_ARRAY_LAYERS)
+            .base_array_layer(0)
+            .level_count(vk::REMAINING_MIP_LEVELS)
+            .base_mip_level(0);
+
+        let create_info = vk::ImageViewCreateInfo::builder()
+            .components(vk::ComponentMapping::default())
+            .format(vk::Format::D24_UNORM_S8_UINT)
+            .image(texture.image)
+            .subresource_range(subresource_range.build())
+            .view_type(vk::ImageViewType::TYPE_2D);
+
+        let image_view = device.raw().create_image_view(&create_info, None)?;
+
+        Ok(Self {
+            is_managed: false,
+            device,
+            image_view,
+            width: desc.extent.width,
+            height: desc.extent.height,
+        })
+    }
+
+    unsafe fn from_managed(
+        device: Arc<Device>,
+        image_view: vk::ImageView,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            is_managed: true,
+            device,
+            image_view,
+            width,
+            height,
+        }
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn raw(&self) -> vk::ImageView {
+        self.image_view
+    }
+}
+
+struct ShaderModule {
+    device: Arc<Device>,
+
+    module: vk::ShaderModule,
+}
+
+impl Drop for ShaderModule {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.raw().destroy_shader_module(self.module, None);
+        }
+    }
+}
+
+impl ShaderModule {
+    unsafe fn new(device: Arc<Device>, code: &[u32]) -> Self {
+        let create_info = vk::ShaderModuleCreateInfo::builder().code(code);
+
+        let module = device
+            .raw()
+            .create_shader_module(&create_info, None)
+            .unwrap();
+
+        Self { device, module }
+    }
+
+    fn raw(&self) -> vk::ShaderModule {
+        self.module
+    }
+}
+
+struct ComputePipelineDesc<'a> {
+    module: &'a ShaderModule,
+}
+
+struct ComputePipeline {
+    device: Arc<Device>,
+
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
+
+impl Drop for ComputePipeline {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.raw().destroy_pipeline(self.pipeline, None);
+            self.device.raw().destroy_pipeline_layout(self.layout, None);
+        }
+    }
+}
+
+impl ComputePipeline {
+    unsafe fn new(device: Arc<Device>, desc: &ComputePipelineDesc) -> Self {
+        let push_constant_ranges = &[vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(256)
+            .build()];
+
+        let create_info = vk::PipelineLayoutCreateInfo::builder()
+            .push_constant_ranges(push_constant_ranges)
+            .build();
+
+        let layout = device
+            .raw()
+            .create_pipeline_layout(&create_info, None)
+            .unwrap();
+
+        let entry_point = CStr::from_bytes_until_nul(b"cs_main\0").unwrap();
+        let stage = vk::PipelineShaderStageCreateInfo::builder()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(desc.module.raw())
+            .name(entry_point)
+            .build();
+
+        let create_info = vk::ComputePipelineCreateInfo::builder()
+            .layout(layout)
+            .stage(stage)
+            .build();
+
+        let pipeline = device
+            .raw()
+            .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
+            .unwrap()[0];
+
+        Self {
+            device,
+
+            layout,
+            pipeline,
+        }
+    }
 }
 
 struct Renderer {
     instance: Arc<Instance>,
     device: Arc<Device>,
+
+    output: Texture,
+    pipeline: ComputePipeline,
 }
 
 impl Renderer {
-    fn new() -> Self {
+    fn new(kernel: &[u32]) -> Self {
         unsafe {
             let instance = Arc::new(Instance::new());
             let mut physical_devices = instance.get_physical_devices();
@@ -266,7 +543,37 @@ impl Renderer {
                 physical_devices.swap_remove(0),
             ));
 
-            Self { instance, device }
+            let output = Texture::new(
+                Arc::clone(&device),
+                &TextureDesc {
+                    extent: Extent3D {
+                        width: 1024,
+                        height: 1024,
+                        depth: 1,
+                    },
+                },
+            )
+            .unwrap();
+
+            let module = ShaderModule::new(Arc::clone(&device), kernel);
+
+            let pipeline = ComputePipeline::new(
+                Arc::clone(&device),
+                &ComputePipelineDesc { module: &module },
+            );
+
+            Self {
+                instance,
+                device,
+                output,
+                pipeline,
+            }
+        }
+    }
+
+    fn render(&self) {
+        unsafe {
+            self.device.device.device_wait_idle().unwrap();
         }
     }
 }
@@ -373,9 +680,14 @@ impl ShaderCompiler {
 }
 
 fn main() {
-    let renderer = Renderer::new();
     let compiler = ShaderCompiler::new();
-    let kernel = compiler.compile_hlsl("kernel/kernel.hlsl", ShaderStage::Compute).unwrap();
+    let kernel = compiler
+        .compile_hlsl("kernel/kernel.hlsl", ShaderStage::Compute)
+        .unwrap();
+
+    let renderer = Renderer::new(bytemuck::cast_slice(&kernel));
+
+    renderer.render();
 
     let image = LdrImage::new(1024, 1024);
     image.save("test.png");
