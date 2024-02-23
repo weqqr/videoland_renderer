@@ -1,3 +1,9 @@
 /target
 /bin
 *.png
+
+__pycache__
+
+/addons/videoland/kernel
+/addons/videoland/*.pyd
+/addons/videoland/*.dll

@@ -1,13 +1,14 @@
-[workspace]
-members = ["videoland_py", "videoland_renderer", "xtask"]
-
 [package]
-name = "videoland_renderer_standalone"
+name = "videoland_py"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "videoland"
+crate-type = ["cdylib"]
 
 [dependencies]
 bytemuck = "1.14.3"
-videoland_renderer = { path = "videoland_renderer" }
+pyo3 = "0.20.3"
+videoland_renderer = { path = "../videoland_renderer" }
