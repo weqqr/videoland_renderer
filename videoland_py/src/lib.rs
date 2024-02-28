@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use videoland_renderer::{ShaderCompiler, ShaderStage};
+use videoland_renderer::{HdrImage, ShaderCompiler, ShaderStage};
 
 #[pyclass]
 pub struct Renderer {
@@ -17,13 +17,19 @@ impl Renderer {
 
         let renderer = videoland_renderer::Renderer::new(bytemuck::cast_slice(&kernel));
 
-        Ok(Self {
-            renderer,
-        })
+        Ok(Self { renderer })
     }
 
-    fn render(&self) {
+    fn render<'a>(&self, width: i32, height: i32, py: Python<'a>) -> PyResult<&'a PyAny> {
         self.renderer.render();
+        let image = HdrImage::new(width as u32, height as u32);
+
+        let array = PyModule::import(py, "array")?;
+        let data = array
+            .getattr("array")?
+            .call1(("f", image.into_values()));
+
+        data
     }
 }
 

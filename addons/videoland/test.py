@@ -1,4 +1,4 @@
 import videoland
 
 r = videoland.Renderer()
-r.render()
+data = r.render(1024, 1024)

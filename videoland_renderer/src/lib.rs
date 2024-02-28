@@ -1052,6 +1052,26 @@ impl LdrImage {
     }
 }
 
+pub struct HdrImage {
+    data: Vec<f32>,
+    width: u32,
+    height: u32,
+}
+
+impl HdrImage {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            data: vec![0.0; 4 * width as usize * height as usize],
+            width,
+            height,
+        }
+    }
+
+    pub fn into_values(self) -> Vec<f32> {
+        self.data
+    }
+}
+
 unsafe extern "system" fn vulkan_debug_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _message_type: vk::DebugUtilsMessageTypeFlagsEXT,

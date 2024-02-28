@@ -54,33 +54,36 @@ fn bundle() -> TaskResult {
 }
 
 fn copy<F: AsRef<Path>, T: AsRef<Path>>(from: F, to: T) -> TaskResult {
-    let from = project_dir().join(from.as_ref());
-    let to = project_dir().join(to.as_ref());
+    let from_relative = from.as_ref().strip_prefix(project_dir()).unwrap_or(from.as_ref());
+    let to_relative = to.as_ref().strip_prefix(project_dir()).unwrap_or(to.as_ref());
+
+    let from_absolute = project_dir().join(from_relative);
+    let to_absolute = project_dir().join(to_relative);
 
     println!(
-        "Copying {} to {}",
-        from.to_string_lossy(),
-        to.to_string_lossy()
+        "     Copying `{}` to `{}`",
+        from_relative.to_string_lossy(),
+        to_relative.to_string_lossy()
     );
 
-    std::fs::copy(from, to)?;
+    std::fs::copy(from_absolute, to_absolute)?;
 
     Ok(())
 }
 
 fn copy_dir<F: AsRef<Path>, T: AsRef<Path>>(from: F, to: T) -> TaskResult {
-    let from = project_dir().join(from.as_ref());
-    let to = project_dir().join(to.as_ref());
+    let from_absolute = project_dir().join(from.as_ref());
+    let to_absolute = project_dir().join(to.as_ref());
 
     println!(
-        "Copying directory {} to {}",
-        from.to_string_lossy(),
-        to.to_string_lossy()
+        "     Copying directory `{}` to `{}`",
+        from.as_ref().to_string_lossy(),
+        to.as_ref().to_string_lossy()
     );
 
     let _ = std::fs::remove_dir_all(&to);
 
-    copy_dir_recursive(&from, &to)?;
+    copy_dir_recursive(&from_absolute, &to_absolute)?;
 
     Ok(())
 }
